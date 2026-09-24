@@ -12,14 +12,18 @@ use jni::{
 use log::info;
 
 // Android File struct definition
+//
+// Deliberately holds no JNI handle: all fields are plain Rust data, and any
+// operation that needs the Java-side DocumentFile re-resolves it from `url`
+// within its own attach window. GlobalRefs therefore never escape a call, so
+// they cannot end up dropped on a detached thread.
 #[derive(Debug, Clone)]
 pub struct AndroidFile {
-    pub filename: String,     // File name
-    pub size: usize,          // File size in bytes, behavior undefined for directories
-    pub path: String,         // Path (not valid path, only for display)
-    pub url: String,          // Content URI (use THIS to obtain the AndroidFile object again)
-    pub is_dir: bool,         // Is the file a directory
-    document_file: GlobalRef, // JNI DocumentFile JObject representing the file
+    pub filename: String, // File name
+    pub size: usize,      // File size in bytes, behavior undefined for directories
+    pub path: String,     // Path (not valid path, only for display)
+    pub url: String,      // Content URI (use THIS to obtain the AndroidFile object again)
+    pub is_dir: bool,     // Is the file a directory
 }
 
 // Android File system features
@@ -52,12 +56,11 @@ fn get_global_context(env: &mut JNIEnv) -> Result<GlobalRef> {
     Ok(env.new_global_ref(application)?)
 }
 
-/// Create an AndroidFile object from a content tree URL obtained from Storage Access Framework (SAF).
-pub fn from_tree_url(url: &str) -> Result<AndroidFile> {
-    info!("Creating AndroidFile object from URL: {}", url);
-    // Obtain JNIEnv using improved get_env function
-    let mut env_guard = get_env()?;
-    let env = &mut *env_guard;
+/// Resolve a content URL into a DocumentFile Java object. The returned JObject
+/// is a local reference tied to the caller's attach window: the caller must
+/// hold an `AttachGuard` (obtained via `get_env`) and finish using the object
+/// before that guard is dropped.
+fn document_file_from_url<'local>(env: &mut JNIEnv<'local>, url: &str) -> Result<JObject<'local>> {
     let context = get_global_context(env)?;
 
     // Convert Rust string to Java string, and parse it as a URI
@@ -99,7 +102,7 @@ pub fn from_tree_url(url: &str) -> Result<AndroidFile> {
     let input_str: String = env.get_string(&input_uri_str.into())?.into();
 
     if parent_str.starts_with(&input_str) {
-        return Ok(from_document_file(&parent)?);
+        return Ok(parent);
     }
 
     // Otherwise, we create a TreeDocumentFile pointing to child file.
@@ -114,7 +117,18 @@ pub fn from_tree_url(url: &str) -> Result<AndroidFile> {
         ],
     )?;
 
-    Ok(from_document_file(&document_file)?)
+    Ok(document_file)
+}
+
+/// Create an AndroidFile object from a content tree URL obtained from Storage Access Framework (SAF).
+pub fn from_tree_url(url: &str) -> Result<AndroidFile> {
+    info!("Creating AndroidFile object from URL: {}", url);
+    // Obtain JNIEnv using improved get_env function
+    let mut env_guard = get_env()?;
+    let env = &mut *env_guard;
+
+    let document_file = document_file_from_url(env, url)?;
+    from_document_file(&document_file)
 }
 
 /// Create an AndroidFile object from a DocumentFile Java object.
@@ -168,17 +182,14 @@ pub fn from_document_file(document_file: &JObject) -> Result<AndroidFile> {
         .z()
         .unwrap_or(false);
 
-    // Create GlobalRef from DocumentFile object
-    let document_file_ref = env.new_global_ref(document_file)?;
-
-    // Construct AndroidFile struct
+    // Construct AndroidFile struct. No JNI handle is stored on the struct: the
+    // DocumentFile is re-resolved from `url` by the operations that need it.
     Ok(AndroidFile {
         filename,
         size,
         path,
         url,
         is_dir,
-        document_file: document_file_ref,
     })
 }
 
@@ -352,10 +363,6 @@ impl AndroidFileOps for AndroidFile {
             .get_static_field(document_class, "MIME_TYPE_DIR", "Ljava/lang/String;")?
             .l()?;
 
-        // Resolve via the cached app ClassLoader: a bare FindClass from a
-        // Rust-spawned thread hits the boot classloader and misses androidx.
-        let document_file_class = find_class("androidx/documentfile/provider/DocumentFile")?;
-
         let mut files = Vec::new();
         // Check if cursor is not null
         if !cursor.is_null() {
@@ -440,28 +447,16 @@ impl AndroidFileOps for AndroidFile {
                     )?
                     .z()?;
 
-                // Create DocumentFile object
-                let document_file = env
-                    .call_static_method(
-                        &document_file_class,
-                        "fromSingleUri",
-                        "(Landroid/content/Context;Landroid/net/Uri;)Landroidx/documentfile/provider/DocumentFile;",
-                        &[JValueGen::Object(context.as_obj()), JValueGen::Object(&child_uri)],
-                    )?
-                    .l()?;
-
-                if !document_file.is_null() {
-                    let document_file_ref = env.new_global_ref(&document_file)?;
-
-                    files.push(AndroidFile {
-                        filename,
-                        size,
-                        path,
-                        url,
-                        is_dir,
-                        document_file: document_file_ref,
-                    });
-                }
+                // All metadata comes from the cursor columns; no Java-side
+                // DocumentFile is needed until an operation re-resolves it
+                // from the URL.
+                files.push(AndroidFile {
+                    filename,
+                    size,
+                    path,
+                    url,
+                    is_dir,
+                });
             }
             // Close the cursor
             env.call_method(&cursor, "close", "()V", &[])?.v()?;
@@ -495,13 +490,17 @@ impl AndroidFileOps for AndroidFile {
         let mut env_guard = get_env()?;
         let env = &mut *env_guard;
 
+        // Re-resolve the DocumentFile for this directory from its URL; the
+        // struct stores no JNI handle of its own.
+        let document_file = document_file_from_url(env, &self.url)?;
+
         // Convert MIME type and file name to Java strings
         let mime_type_str = env.new_string(mime_type)?;
         let file_name_str = env.new_string(file_name)?;
 
         // Create a new file in the directory
         let new_file = env.call_method(
-            &self.document_file,
+            &document_file,
             "createFile",
             "(Ljava/lang/String;Ljava/lang/String;)Landroidx/documentfile/provider/DocumentFile;",
             &[JValueGen::Object(&mime_type_str), JValueGen::Object(&file_name_str)],
@@ -528,13 +527,17 @@ impl AndroidFileOps for AndroidFile {
         let mut env_guard = get_env()?;
         let env = &mut *env_guard;
 
+        // Re-resolve the DocumentFile for this directory from its URL; the
+        // struct stores no JNI handle of its own.
+        let document_file = document_file_from_url(env, &self.url)?;
+
         // Convert directory name to Java string
         let file_name_str = env.new_string(dir_name)?;
 
         // Create a new file in the directory
         let new_dir = env
             .call_method(
-                &self.document_file,
+                &document_file,
                 "createDirectory",
                 "(Ljava/lang/String;)Landroidx/documentfile/provider/DocumentFile;",
                 &[JValueGen::Object(&file_name_str)],
@@ -552,10 +555,12 @@ impl AndroidFileOps for AndroidFile {
         let mut env_guard = get_env()?;
         let env = &mut *env_guard;
 
+        // Re-resolve the DocumentFile from the URL; the struct stores no JNI
+        // handle of its own.
+        let document_file = document_file_from_url(env, &self.url)?;
+
         // Delete the file or directory
-        let result = env
-            .call_method(self.document_file.as_obj(), "delete", "()Z", &[])?
-            .z()?;
+        let result = env.call_method(&document_file, "delete", "()Z", &[])?.z()?;
 
         Ok(result)
     }
